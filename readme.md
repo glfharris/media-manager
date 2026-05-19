@@ -4,7 +4,6 @@ Reuse and clean up images in your Anki collection. Browse `collection.media`, au
 
 ![Main browser opened from a card editor](main.jpg)
 
-*Suggested screenshot: the main browser opened from an editor, showing the auto-populated related grid on the left and the info panel on the right with an image selected (dimensions, ref count, and a few tags visible).*
 
 ## Features
 
