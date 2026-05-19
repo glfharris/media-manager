@@ -1,0 +1,13 @@
+{
+    "page_size": 200,
+    "thumbnail_px": 128,
+    "image_extensions": ["jpg", "jpeg", "png", "gif", "webp", "bmp", "svg", "avif"],
+    "related_limit": 40,
+    "min_token_length": 3,
+    "candidate_cap": 300,
+    "keyword_search_cap": 500,
+    "rare_tag_max_fraction": 0.2,
+    "weight_tag": 1.0,
+    "weight_image": 2.0,
+    "weight_text": 1.0
+}
