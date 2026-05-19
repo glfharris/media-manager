@@ -23,7 +23,7 @@ Reuse and clean up images in your Anki collection. Browse `collection.media`, au
 
 ## Install
 
-**AnkiWeb**: search "Media Manager" or install with code *[code TBD on publish]*. Restart Anki.
+**AnkiWeb**: search "Media Manager" or install with code *126796547*. Restart Anki.
 
 **Development**: clone the repo, then `just test` copies the addon into `~/.local/share/Anki2/addons21/media-manager-test/` and launches Anki. `just build` packages `build/media-manager-anki_v21.ankiaddon` for upload or direct sideload.
 
