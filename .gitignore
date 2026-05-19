@@ -1,5 +1,6 @@
 .vscode
 *.zip
+*.ankiaddon
 
 profile
 __pycache__

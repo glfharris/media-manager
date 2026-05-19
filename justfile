@@ -1,8 +1,10 @@
 addon_dir := `echo ~/.local/share/Anki2/addons21/media-manager-test`
+package := "media-manager-anki_v21"
 
 build:
+    rm -rf media_manager/__pycache__
     mkdir -p ./build
-    zip -r -j ./build/media-manager-anki_v21.zip media_manager
+    cd media_manager && zip -r ../build/{{ package }}.ankiaddon . -x "*__pycache__*"
 
 clean:
     rm -rf ./build
