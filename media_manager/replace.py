@@ -5,7 +5,7 @@ the file on disk or by rewriting references across notes.
 from __future__ import annotations
 
 import os
-import re
+import html
 import shutil
 
 from aqt import mw
@@ -32,21 +32,11 @@ from . import media_index, thumbnails
 THUMB_PX = 180
 
 
-def _src_attr_pattern(filename: str) -> re.Pattern[str]:
-    """Match `src="filename"` or `src='filename'` regardless of quote style."""
-    escaped = re.escape(filename)
-    return re.compile(
-        rf"""(<img[^>]*\bsrc=)(["']){escaped}\2""",
-        re.IGNORECASE,
-    )
-
-
 def rewrite_references(old: str, new: str) -> tuple[int, int]:
     """Rewrite every img src="old" to src="new" across notes.
 
     Returns (notes_updated, fields_updated).
     """
-    pattern = _src_attr_pattern(old)
     nids = media_index.notes_referencing(old)
     notes_updated = 0
     fields_updated = 0
@@ -54,7 +44,7 @@ def rewrite_references(old: str, new: str) -> tuple[int, int]:
         note = mw.col.get_note(nid)
         changed = False
         for i, field in enumerate(note.fields):
-            new_field, n = pattern.subn(rf"\g<1>\g<2>{new}\g<2>", field)
+            new_field, n = media_index.rewrite_img_srcs(field, old, new)
             if n:
                 note.fields[i] = new_field
                 fields_updated += n
@@ -62,6 +52,8 @@ def rewrite_references(old: str, new: str) -> tuple[int, int]:
         if changed:
             mw.col.update_note(note)
             notes_updated += 1
+    if fields_updated:
+        media_index.invalidate_media_caches()
     return notes_updated, fields_updated
 
 
@@ -72,6 +64,7 @@ def replace_on_disk(old_filename: str, new_source_path: str) -> None:
     """
     dest = media_index.media_path(old_filename)
     shutil.copyfile(new_source_path, dest)
+    media_index.invalidate_media_caches()
 
 
 class ReplaceDialog(QDialog):
@@ -108,6 +101,7 @@ class ReplaceDialog(QDialog):
         self.new_thumb_label.setStyleSheet("border: 1px dashed gray;")
         self.new_thumb_box.addWidget(self.new_thumb_label)
         self.new_thumb_caption = QLabel("New: —")
+        self.new_thumb_caption.setTextFormat(Qt.TextFormat.PlainText)
         self.new_thumb_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.new_thumb_box.addWidget(self.new_thumb_caption)
         header.addLayout(self.new_thumb_box)
@@ -170,6 +164,7 @@ class ReplaceDialog(QDialog):
         else:
             thumb.setText("(no preview)")
         cap = QLabel(caption)
+        cap.setTextFormat(Qt.TextFormat.PlainText)
         cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
         wrapper_box.addWidget(thumb)
         wrapper_box.addWidget(cap)
@@ -232,7 +227,7 @@ class ReplaceDialog(QDialog):
         confirm = QMessageBox.question(
             self,
             "Confirm replace",
-            f"This will {verb} <b>{self.old_filename}</b> across "
+            f"This will {verb} <b>{html.escape(self.old_filename)}</b> across "
             f"<b>{self._affected}</b> note(s). Continue?",
         )
         if confirm != QMessageBox.StandardButton.Yes:
@@ -253,6 +248,7 @@ class ReplaceDialog(QDialog):
             else:
                 new_name = self.new_media_name
             n_notes, n_fields = rewrite_references(self.old_filename, new_name)
+            media_index.invalidate_media_caches()
             tooltip(
                 f"Rewrote {n_fields} reference(s) in {n_notes} note(s) "
                 f"→ {new_name}."

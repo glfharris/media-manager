@@ -10,6 +10,7 @@ fetch for where you land.
 
 from __future__ import annotations
 
+import html
 import os
 from datetime import datetime
 from typing import Optional
@@ -64,6 +65,7 @@ class InfoPanel(QWidget):
         super().__init__(parent)
         self.setFixedWidth(300)
         self._current: Optional[str] = None
+        self._reasons: list[str] = []
 
         self._update_timer = QTimer(self)
         self._update_timer.setSingleShot(True)
@@ -87,6 +89,7 @@ class InfoPanel(QWidget):
         layout.addWidget(self.preview)
 
         self.name_lbl = QLabel("")
+        self.name_lbl.setTextFormat(Qt.TextFormat.PlainText)
         self.name_lbl.setWordWrap(True)
         self.name_lbl.setStyleSheet("font-weight: bold;")
         self.name_lbl.setTextInteractionFlags(
@@ -97,6 +100,12 @@ class InfoPanel(QWidget):
         self.stats_lbl = QLabel("")
         self.stats_lbl.setStyleSheet("color: gray;")
         layout.addWidget(self.stats_lbl)
+
+        self.why_header = QLabel("Why suggested:")
+        layout.addWidget(self.why_header)
+        self.why_list = QListWidget()
+        self.why_list.setMaximumHeight(120)
+        layout.addWidget(self.why_list)
 
         refs_row = QHBoxLayout()
         self.refs_lbl = QLabel("")
@@ -137,9 +146,14 @@ class InfoPanel(QWidget):
 
     # ------- public API -------
 
-    def show_image(self, filename: Optional[str]) -> None:
+    def show_image(
+        self,
+        filename: Optional[str],
+        reasons: Optional[list[str]] = None,
+    ) -> None:
         """Called by the grid when selection changes. Debounced."""
         self._current = filename
+        self._reasons = reasons or []
         if filename is None:
             self._update_timer.stop()
             self._clear()
@@ -153,6 +167,9 @@ class InfoPanel(QWidget):
         self.preview.setText("(select an image)")
         self.name_lbl.setText("")
         self.stats_lbl.setText("")
+        self.why_list.clear()
+        self.why_header.setVisible(False)
+        self.why_list.setVisible(False)
         self.refs_lbl.setText("")
         self.view_btn.setEnabled(False)
         self.tags_list.clear()
@@ -202,6 +219,13 @@ class InfoPanel(QWidget):
         self.stats_lbl.setText(
             f"{dim_str}  ·  {_humanize_bytes(size_bytes)}  ·  {date_str}"
         )
+
+        self.why_list.clear()
+        show_why = bool(self._reasons)
+        self.why_header.setVisible(show_why)
+        self.why_list.setVisible(show_why)
+        for reason in self._reasons:
+            self.why_list.addItem(QListWidgetItem(reason))
 
         # Refs + tags
         nids = media_index.notes_referencing(filename)
@@ -255,12 +279,13 @@ class InfoPanel(QWidget):
         if not filename:
             return
         msg = (
-            f"Move <b>{filename}</b> to Anki's media trash? "
+            f"Move <b>{html.escape(filename)}</b> to Anki's media trash? "
             "It can be recovered from there."
         )
         if self._ref_count > 0:
             msg = (
-                f"<b>{filename}</b> is referenced by <b>{self._ref_count}</b> "
+                f"<b>{html.escape(filename)}</b> is referenced by "
+                f"<b>{self._ref_count}</b> "
                 "note(s). Moving it to trash will break those references "
                 "until you restore the file.<br><br>" + msg
             )

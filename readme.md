@@ -28,4 +28,4 @@ Reuse and clean up images in your Anki collection. Browse `collection.media`, au
 
 ## Configuration
 
-Tools → Add-ons → Media Manager → Config. Tunable: thumbnail size, similarity-scoring weights (tag / image-neighborhood / text TF-IDF), keyword-search cap, rare-tag fraction. Defaults work for collections up to ~50k notes; first open per session pays a one-off ~1–3s stats build.
+Tools → Add-ons → Media Manager → Config. Tunable: thumbnail size, similarity-scoring weights (filename / tag / image-neighborhood / text TF-IDF), keyword-search cap, rare-tag fraction. Defaults work for collections up to ~50k notes; first open per session pays a one-off ~1–3s stats build.

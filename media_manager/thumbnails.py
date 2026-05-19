@@ -104,10 +104,10 @@ class _Loader(QObject):
 
     def __init__(self) -> None:
         super().__init__()
-        self._pool = QThreadPool.globalInstance()
-        # Cap concurrency: image decode is CPU-bound and we don't want to
-        # starve the GUI thread on a 16-core box.
-        self._pool.setMaxThreadCount(min(4, self._pool.maxThreadCount()))
+        self._pool = QThreadPool(self)
+        # Cap this add-on's thumbnail decoding without changing Anki's global
+        # thread pool, which other add-ons may also use.
+        self._pool.setMaxThreadCount(4)
         self._inflight: set[tuple[str, int]] = set()
         self._signals = _WorkerSignals()
         self._signals.done.connect(self._on_done)

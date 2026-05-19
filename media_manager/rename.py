@@ -4,6 +4,7 @@ reference to use the new name.
 
 from __future__ import annotations
 
+import html
 import os
 
 from aqt import mw
@@ -53,13 +54,16 @@ def rename_image(old: str, new: str) -> tuple[int, int]:
         raise ValueError(f"A file named {new!r} already exists in the media folder.")
     os.rename(src, dst)
     try:
-        return rewrite_references(old, new)
+        result = rewrite_references(old, new)
+        media_index.invalidate_media_caches()
+        return result
     except Exception:
         # Best-effort rollback: put the file back so refs still resolve.
         try:
             os.rename(dst, src)
         except OSError:
             pass
+        media_index.invalidate_media_caches()
         raise
 
 
@@ -87,7 +91,9 @@ class RenameDialog(QDialog):
             thumb.setText("(no preview)")
         layout.addWidget(thumb, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        layout.addWidget(QLabel(f"Current name: <b>{self.old_filename}</b>"))
+        current_label = QLabel(f"Current name: {self.old_filename}")
+        current_label.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(current_label)
         layout.addWidget(QLabel("New name:"))
         self.name_edit = QLineEdit(self.old_filename)
         self.name_edit.textChanged.connect(self._validate)
@@ -140,7 +146,8 @@ class RenameDialog(QDialog):
         confirm = QMessageBox.question(
             self,
             "Confirm rename",
-            f"Rename <b>{self.old_filename}</b> → <b>{new}</b> and update "
+            f"Rename <b>{html.escape(self.old_filename)}</b> → "
+            f"<b>{html.escape(new)}</b> and update "
             f"<b>{self._affected}</b> note(s)?",
         )
         if confirm != QMessageBox.StandardButton.Yes:

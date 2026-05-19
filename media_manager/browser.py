@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 from typing import Optional
 
@@ -24,6 +25,7 @@ from aqt.qt import (
     QSize,
     Qt,
     QVBoxLayout,
+    pyqtSignal,
 )
 from aqt.utils import showWarning, tooltip
 
@@ -91,6 +93,8 @@ class _MediaGrid(QListWidget):
     drop in as the loader finishes decoding them off-thread.
     """
 
+    count_changed = pyqtSignal(int, int)  # loaded, total
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setViewMode(QListView.ViewMode.IconMode)
@@ -114,13 +118,32 @@ class _MediaGrid(QListWidget):
         self.setStyleSheet("QListView::item { padding: 0px; margin: 0px; }")
         # filename -> list of items currently awaiting a thumbnail
         self._pending: dict[str, list[QListWidgetItem]] = {}
+        self._filenames: list[str] = []
+        self._loaded_count = 0
         thumbnails.loader.loaded.connect(self._on_thumb_loaded)
+        self.verticalScrollBar().valueChanged.connect(self._maybe_load_more)
 
     def populate(self, filenames: list[str]) -> None:
         self.clear()
         self._pending.clear()
+        self._filenames = list(filenames)
+        self._loaded_count = 0
+        self._load_more()
+        self.scrollToTop()
+        self.count_changed.emit(self._loaded_count, len(self._filenames))
+
+    def loaded_count(self) -> int:
+        return self._loaded_count
+
+    def total_count(self) -> int:
+        return len(self._filenames)
+
+    def _load_more(self) -> None:
+        if self._loaded_count >= len(self._filenames):
+            return
         placeholder_icon = QIcon(thumbnails.placeholder(self._thumb_px))
-        for name in filenames[: _page_size()]:
+        end = min(len(self._filenames), self._loaded_count + _page_size())
+        for name in self._filenames[self._loaded_count:end]:
             item = QListWidgetItem(name)
             item.setData(Qt.ItemDataRole.UserRole, name)
             item.setToolTip(name)
@@ -133,6 +156,16 @@ class _MediaGrid(QListWidget):
                 item.setIcon(placeholder_icon)
                 self._pending.setdefault(name, []).append(item)
             self.addItem(item)
+        self._loaded_count = end
+
+    def _maybe_load_more(self, _value: int = 0) -> None:
+        scrollbar = self.verticalScrollBar()
+        if scrollbar.value() < scrollbar.maximum() - scrollbar.pageStep():
+            return
+        old_count = self._loaded_count
+        self._load_more()
+        if self._loaded_count != old_count:
+            self.count_changed.emit(self._loaded_count, len(self._filenames))
 
     def _on_thumb_loaded(self, filename: str, size: int) -> None:
         if size != self._thumb_px:
@@ -168,6 +201,8 @@ class MediaBrowserDialog(QDialog):
         self.editor = editor
         self.setWindowTitle("Media Manager")
         self._all_files: list[str] = []
+        self._count_label_factory: Optional[Callable[[int, int], str]] = None
+        self._suggestion_reasons: dict[str, list[str]] = {}
         self._build_ui()
         self._reload()
 
@@ -196,6 +231,7 @@ class MediaBrowserDialog(QDialog):
         self.grid = _MediaGrid()
         self.grid.itemDoubleClicked.connect(self._on_insert)
         self.grid.currentItemChanged.connect(self._on_selection_changed)
+        self.grid.count_changed.connect(self._update_grid_count_label)
         mid.addWidget(self.grid, 1)
 
         self.info_panel = InfoPanel()
@@ -250,40 +286,62 @@ class MediaBrowserDialog(QDialog):
         self._all_files = media_index.list_image_files()
         self._apply_filter()
 
+    def _show_files(
+        self,
+        filenames: list[str],
+        label_factory: Callable[[int, int], str],
+    ) -> None:
+        self._count_label_factory = label_factory
+        self.grid.populate(filenames)
+        self._update_grid_count_label(
+            self.grid.loaded_count(), self.grid.total_count()
+        )
+
+    def _update_grid_count_label(self, shown: int, total: int) -> None:
+        if self._count_label_factory is not None:
+            self.count_label.setText(self._count_label_factory(shown, total))
+
     def _apply_filter(self) -> None:
         cfg = _cfg()
         raw = self.search.text().strip()
         total = len(self._all_files)
+        self._suggestion_reasons = {}
         # Reset bulk delete button; specific branches re-enable it.
         self.bulk_delete_btn.setVisible(False)
 
         if not raw:
             related = self._build_related_list()
             if related is not None:
-                self.grid.populate(related)
-                shown = min(len(related), _page_size())
-                self.count_label.setText(
-                    f"{shown} related to this card / {total} total "
-                    "— type * to show all"
+                self._show_files(
+                    related,
+                    lambda shown, _filtered_total: (
+                        f"{shown} related to this card / {total} total "
+                        "— type * to show all"
+                    ),
                 )
             else:
-                self.grid.populate(self._all_files)
-                shown = min(total, _page_size())
-                self.count_label.setText(f"{shown} shown / {total} total")
+                self._show_files(
+                    self._all_files,
+                    lambda shown, filtered_total: (
+                        f"{shown} shown / {filtered_total} total"
+                    ),
+                )
             return
 
         if raw == "*":
-            self.grid.populate(self._all_files)
-            shown = min(total, _page_size())
-            self.count_label.setText(f"{shown} shown / {total} total — all images")
+            self._show_files(
+                self._all_files,
+                lambda shown, filtered_total: (
+                    f"{shown} shown / {filtered_total} total — all images"
+                ),
+            )
             return
 
         if raw == "is:unused":
             orphans = media_index.find_orphans()
-            self.grid.populate(orphans)
-            shown = min(len(orphans), _page_size())
-            self.count_label.setText(
-                f"{shown} unused / {total} total"
+            self._show_files(
+                orphans,
+                lambda shown, _filtered_total: f"{shown} unused / {total} total",
             )
             if orphans:
                 self.bulk_delete_btn.setText(f"Delete {len(orphans)} unused…")
@@ -296,11 +354,12 @@ class MediaBrowserDialog(QDialog):
                 {fn for v in groups.values() for fn in v},
                 key=str.lower,
             )
-            self.grid.populate(files)
-            shown = min(len(files), _page_size())
-            self.count_label.setText(
-                f"{shown} duplicated / {total} total — "
-                f"{len(groups)} group(s)"
+            self._show_files(
+                files,
+                lambda shown, _filtered_total: (
+                    f"{shown} duplicated / {total} total — "
+                    f"{len(groups)} group(s)"
+                ),
             )
             return
 
@@ -309,11 +368,12 @@ class MediaBrowserDialog(QDialog):
             self._all_files,
             note_cap=int(cfg.get("keyword_search_cap", 500)),
         )
-        self.grid.populate(combined)
-        shown = min(len(combined), _page_size())
-        self.count_label.setText(
-            f"{shown} shown — {n_name} by name + {n_note} from notes "
-            f"/ {total} total"
+        self._show_files(
+            combined,
+            lambda shown, _filtered_total: (
+                f"{shown} shown — {n_name} by name + {n_note} from notes "
+                f"/ {total} total"
+            ),
         )
 
     def _build_related_list(self) -> Optional[list[str]]:
@@ -329,14 +389,14 @@ class MediaBrowserDialog(QDialog):
         min_len = int(cfg.get("min_token_length", 3))
         limit = int(cfg.get("related_limit", 40))
 
-        by_name = media_index.related_by_filename(
-            note, self._all_files, min_len=min_len, limit=limit,
-        )
-        by_sim = media_index.related_by_similar_notes(
+        suggestions = media_index.related_images(
             note,
+            self._all_files,
+            min_len=min_len,
             limit=limit,
             cap=int(cfg.get("candidate_cap", 300)),
             rare_tag_max_fraction=float(cfg.get("rare_tag_max_fraction", 0.2)),
+            weight_filename=float(cfg.get("weight_filename", 1.0)),
             weight_tag=float(cfg.get("weight_tag", 1.0)),
             weight_image=float(cfg.get("weight_image", 2.0)),
             weight_text=float(cfg.get("weight_text", 1.0)),
@@ -350,16 +410,14 @@ class MediaBrowserDialog(QDialog):
             if fn in existing and fn not in seen:
                 result.append(fn)
                 seen.add(fn)
-        # 2. Filename-token matches.
-        for fn, _ in by_name:
+                self._suggestion_reasons[fn] = ["Already on this card."]
+        # 2. Combined filename and similar-note ranking.
+        for suggestion in suggestions:
+            fn = suggestion.filename
             if fn in existing and fn not in seen:
                 result.append(fn)
                 seen.add(fn)
-        # 3. Images on similar notes.
-        for fn, _ in by_sim:
-            if fn in existing and fn not in seen:
-                result.append(fn)
-                seen.add(fn)
+                self._suggestion_reasons[fn] = list(suggestion.reasons)
         return result or None
 
     def _current_note(self):
@@ -380,7 +438,7 @@ class MediaBrowserDialog(QDialog):
         if self.editor is None:
             tooltip("No editor to insert into.")
             return
-        html_snippet = f'<img src="{name}">'
+        html_snippet = media_index.img_html(name)
         self.editor.web.eval(
             f"pasteHTML({json.dumps(html_snippet)}, true, false);"
         )
@@ -422,7 +480,8 @@ class MediaBrowserDialog(QDialog):
         filename = (
             current.data(Qt.ItemDataRole.UserRole) if current is not None else None
         )
-        self.info_panel.show_image(filename)
+        reasons = self._suggestion_reasons.get(filename or "", [])
+        self.info_panel.show_image(filename, reasons)
 
     def _on_search_requested(self, query: str) -> None:
         self.search.setText(query)

@@ -11,13 +11,19 @@ import html
 import math
 import os
 import re
+import urllib.parse
 from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from aqt import mw
 
-IMG_SRC_RE = re.compile(r"""<img[^>]+src=["']([^"']+)["']""", re.IGNORECASE)
+IMG_TAG_RE = re.compile(r"""<img\b[^>]*>""", re.IGNORECASE)
+SRC_ATTR_RE = re.compile(
+    r"""(?P<prefix>(?:^|[\s<])src\s*=\s*)"""
+    r"""(?:"(?P<double>[^"]*)"|'(?P<single>[^']*)'|(?P<bare>[^\s>]+))""",
+    re.IGNORECASE,
+)
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
@@ -56,6 +62,63 @@ def media_path(filename: str) -> str:
     return os.path.join(mw.col.media.dir(), filename)
 
 
+def img_html(filename: str) -> str:
+    """Return an HTML img tag for an Anki media filename."""
+    return f'<img src="{html.escape(filename, quote=True)}">'
+
+
+def _src_value(match: re.Match[str]) -> str:
+    for name in ("double", "single", "bare"):
+        value = match.group(name)
+        if value is not None:
+            return value
+    return ""
+
+
+def _filename_from_src(src: str) -> str:
+    value = html.unescape(src.strip())
+    value = value.split("?", 1)[0].split("#", 1)[0]
+    return urllib.parse.unquote(value)
+
+
+def _reference_search_terms(filename: str) -> list[str]:
+    terms = [
+        filename,
+        html.escape(filename, quote=True),
+        urllib.parse.quote(filename),
+    ]
+    out: list[str] = []
+    for term in terms:
+        if term and term not in out:
+            out.append(term)
+    return out
+
+
+def rewrite_img_srcs(field: str, old: str, new: str) -> tuple[str, int]:
+    """Rewrite matching img src attributes in an HTML field.
+
+    Handles whitespace around `=`, single/double/unquoted attrs, HTML-escaped
+    filenames, URL-encoded filenames, and query/fragment suffixes.
+    """
+    new_src = html.escape(new, quote=True)
+    replacements = 0
+
+    def rewrite_tag(tag_match: re.Match[str]) -> str:
+        nonlocal replacements
+        tag = tag_match.group(0)
+
+        def rewrite_src(src_match: re.Match[str]) -> str:
+            nonlocal replacements
+            if _filename_from_src(_src_value(src_match)) != old:
+                return src_match.group(0)
+            replacements += 1
+            return f'{src_match.group("prefix")}"{new_src}"'
+
+        return SRC_ATTR_RE.sub(rewrite_src, tag)
+
+    return IMG_TAG_RE.sub(rewrite_tag, field), replacements
+
+
 # ---------------------------------------------------------------------------
 # Field / note text utilities
 # ---------------------------------------------------------------------------
@@ -84,10 +147,11 @@ def images_in_note(note) -> list[str]:
 def _images_from_flds(flds: str) -> list[str]:
     """Extract <img src=...> filenames from a flds blob (or any HTML string)."""
     seen: list[str] = []
-    for m in IMG_SRC_RE.findall(flds):
-        name = m.split("?", 1)[0].split("#", 1)[0]
-        if name and name not in seen:
-            seen.append(name)
+    for tag_match in IMG_TAG_RE.finditer(flds):
+        for src_match in SRC_ATTR_RE.finditer(tag_match.group(0)):
+            name = _filename_from_src(_src_value(src_match))
+            if name and name not in seen:
+                seen.append(name)
     return seen
 
 
@@ -135,8 +199,13 @@ def notes_referencing(filename: str) -> list[int]:
     Uses Anki's full-text search to narrow, then re-checks each candidate's
     image refs to filter false positives from coincidental substrings.
     """
-    safe = filename.replace('"', '\\"')
-    nids = mw.col.find_notes(f'"{safe}"')
+    nids: set[int] = set()
+    for term in _reference_search_terms(filename):
+        safe = term.replace('"', '\\"')
+        try:
+            nids.update(mw.col.find_notes(f'"{safe}"'))
+        except Exception:
+            continue
     if not nids:
         return []
     confirmed: list[int] = []
@@ -262,6 +331,14 @@ class _Stats:
     total: int                  # number of notes
     tag_counts: Counter[str]    # tag -> notes-containing
     token_counts: Counter[str]  # sort-field token -> notes-containing
+    image_counts: Counter[str]  # image filename -> notes-containing
+
+
+@dataclass(frozen=True)
+class RelatedImage:
+    filename: str
+    score: float
+    reasons: tuple[str, ...]
 
 
 _STATS: Optional[_Stats] = None
@@ -276,12 +353,20 @@ def _build_stats() -> _Stats:
     rows = mw.col.db.all("SELECT flds, tags FROM notes")
     tag_counts: Counter[str] = Counter()
     token_counts: Counter[str] = Counter()
+    image_counts: Counter[str] = Counter()
     for flds, tags in rows:
         for t in (tags or "").split():
             tag_counts[t] += 1
         for tok in tokens(_flds_text(flds), min_len=_TFIDF_TOKEN_MIN_LEN):
             token_counts[tok] += 1
-    return _Stats(total=len(rows), tag_counts=tag_counts, token_counts=token_counts)
+        for img in _images_from_flds(flds or ""):
+            image_counts[img] += 1
+    return _Stats(
+        total=len(rows),
+        tag_counts=tag_counts,
+        token_counts=token_counts,
+        image_counts=image_counts,
+    )
 
 
 def _stats() -> _Stats:
@@ -349,7 +434,17 @@ def _bulk_fetch_full(
 
 
 def _idf(df: int, total: int) -> float:
-    return math.log(total / (1 + df)) if total > 0 else 0.0
+    return math.log((1 + total) / (1 + df)) if total > 0 else 0.0
+
+
+def _bounded_idf(df: int, total: int) -> float:
+    """IDF normalized to roughly 0..1 for mixing with other scores."""
+    if total <= 2 or df <= 0:
+        return 1.0
+    max_idf = math.log((1 + total) / 2)
+    if max_idf <= 0:
+        return 0.0
+    return max(0.0, min(1.0, _idf(df, total) / max_idf))
 
 
 def _tfidf_vector(toks: set[str], stats: _Stats) -> dict[str, float]:
@@ -383,6 +478,23 @@ def _filename_tokens(filename: str, min_len: int) -> set[str]:
     return tokens(stem, min_len=min_len)
 
 
+def _fmt_names(names: Iterable[str], *, limit: int = 3) -> str:
+    all_values = sorted(names, key=str.lower)
+    shown = all_values[:limit]
+    extra = f" +{len(all_values) - limit}" if len(all_values) > limit else ""
+    return ", ".join(shown) + extra
+
+
+def _top_terms_by_rarity(
+    terms: Iterable[str],
+    counts: Counter[str],
+    *,
+    limit: int = 3,
+) -> list[str]:
+    unique = set(terms)
+    return sorted(unique, key=lambda t: (counts.get(t, 0), t.lower()))[:limit]
+
+
 def related_by_filename(
     note,
     candidates: Iterable[str],
@@ -404,6 +516,37 @@ def related_by_filename(
     return scored[:limit]
 
 
+def _filename_suggestions(
+    note,
+    candidates: Iterable[str],
+    stats: _Stats,
+    *,
+    min_len: int,
+    weight_filename: float,
+) -> dict[str, tuple[float, list[str]]]:
+    note_toks = tokens(note_text(note), min_len=min_len)
+    if not note_toks:
+        return {}
+    out: dict[str, tuple[float, list[str]]] = {}
+    for fname in candidates:
+        shared = note_toks & _filename_tokens(fname, min_len)
+        if not shared:
+            continue
+        rare_terms = _top_terms_by_rarity(
+            shared, stats.token_counts, limit=4
+        )
+        score = sum(
+            _bounded_idf(stats.token_counts.get(t, 0), stats.total)
+            for t in shared
+        )
+        score = min(1.0, score) * weight_filename
+        out[fname] = (
+            score,
+            [f"Filename matches note text: {_fmt_names(rare_terms, limit=4)}"],
+        )
+    return out
+
+
 # ---------- similar-notes pipeline ----------
 
 
@@ -413,15 +556,19 @@ def _candidates(
     cap: int,
     rare_tag_max_fraction: float,
 ) -> set[int]:
-    """Union of three candidate sources, deduplicated, capped at `cap`.
+    """Union of candidate sources, deduplicated.
 
     1. Notes sharing a *rare* tag with the current note.
     2. Notes sharing any image with the current note.
-    3. Notes whose sort field contains the rarest 3 tokens from the current
-       sort field (AND'd in Anki search).
+    3. Notes matching rare note tokens, individually and in small pairs.
+
+    The returned set may be larger than `cap`; final truncation happens after
+    lightweight scoring so older-but-stronger matches are not discarded just
+    because their note ids are lower.
     """
     cands: set[int] = set()
     rare_tag_ceiling = max(1, int(stats.total * rare_tag_max_fraction))
+    gather_cap = max(cap * 4, cap)
 
     # Rarer tags first; never query for tags too common to discriminate.
     sorted_tags = sorted(
@@ -437,37 +584,46 @@ def _candidates(
             continue
         # 100 per tag keeps any single popular tag from monopolising the cap.
         cands.update(nids[:100])
-        if len(cands) >= cap * 2:
+        if len(cands) >= gather_cap:
             break
 
     # Image neighborhood — precise, cheap.
     for img in images_in_note(note):
-        safe = img.replace('"', '\\"')
-        try:
-            nids = mw.col.find_notes(f'"{safe}"')
-        except Exception:
-            continue
+        nids = notes_referencing(img)
         cands.update(nids)
+        if len(cands) >= gather_cap:
+            break
 
-    # Rare tokens from anywhere in the note, AND'd.
+    # Rare tokens from anywhere in the note. Individual token searches improve
+    # recall; rare pairs add precision when the note has enough signal.
     if note.fields:
         note_toks = tokens(note_text(note), min_len=_TFIDF_TOKEN_MIN_LEN)
         rare_toks = sorted(
             (t for t in note_toks
              if 0 < stats.token_counts.get(t, 0) < stats.total * 0.5),
             key=lambda t: stats.token_counts.get(t, 0),
-        )[:3]
-        if rare_toks:
+        )[:6]
+        for tok in rare_toks:
             try:
-                nids = mw.col.find_notes(" ".join(rare_toks))
-                cands.update(nids[:200])
+                nids = mw.col.find_notes(tok)
+                cands.update(nids[:100])
             except Exception:
                 pass
+            if len(cands) >= gather_cap:
+                break
+        for i, left in enumerate(rare_toks[:4]):
+            for right in rare_toks[i + 1:4]:
+                try:
+                    nids = mw.col.find_notes(f"{left} {right}")
+                    cands.update(nids[:100])
+                except Exception:
+                    pass
+                if len(cands) >= gather_cap:
+                    break
+            if len(cands) >= gather_cap:
+                break
 
     cands.discard(note.id)
-    if len(cands) > cap:
-        # Stable subset — sort descending so most recent notes win.
-        cands = set(sorted(cands, reverse=True)[:cap])
     return cands
 
 
@@ -484,54 +640,216 @@ def related_by_similar_notes(
     """Find images on notes deemed similar to `note`.
 
     Pipeline:
-      1. Build a capped candidate set (rare-tag ∪ image-neighbour ∪
+      1. Build a candidate set (rare-tag ∪ image-neighbour ∪
          rare-token search).
       2. Bulk-fetch fields+tags+sort field for all candidates in one SQL call.
-      3. Score each candidate: weighted sum of
-            - Σ idf(shared_tag),
-            - count of shared images,
-            - cosine similarity of TF-IDF sort-field vectors.
-      4. Sum candidate scores into per-image scores, drop images already on
-         the current note, return top `limit`.
+      3. Score each candidate note with bounded tag/image/text components.
+      4. Sum candidate scores into per-image scores, downrank common images,
+         drop images already on the current note, and return top `limit`.
     """
+    existing = set(list_image_files())
+    suggestions = _similar_image_suggestions(
+        note,
+        existing,
+        limit=limit,
+        cap=cap,
+        rare_tag_max_fraction=rare_tag_max_fraction,
+        weight_tag=weight_tag,
+        weight_image=weight_image,
+        weight_text=weight_text,
+    )
+    return [(s.filename, s.score) for s in suggestions]
+
+
+def _similar_image_suggestions(
+    note,
+    existing: set[str],
+    *,
+    limit: int,
+    cap: int,
+    rare_tag_max_fraction: float,
+    weight_tag: float,
+    weight_image: float,
+    weight_text: float,
+) -> list[RelatedImage]:
     stats = _stats()
     if stats.total == 0:
         return []
 
-    cands = _candidates(note, stats, cap=cap, rare_tag_max_fraction=rare_tag_max_fraction)
+    cands = _candidates(
+        note,
+        stats,
+        cap=cap,
+        rare_tag_max_fraction=rare_tag_max_fraction,
+    )
     if not cands:
         return []
 
     rows = _bulk_fetch_full(cands)
     cur_tags = set(note.tags)
     cur_imgs = set(images_in_note(note))
-    cur_vec = _tfidf_vector(
-        tokens(note_text(note), min_len=_TFIDF_TOKEN_MIN_LEN), stats
-    )
+    cur_toks = tokens(note_text(note), min_len=_TFIDF_TOKEN_MIN_LEN)
+    cur_vec = _tfidf_vector(cur_toks, stats)
 
-    image_scores: Counter[str] = Counter()
+    scored_notes: list[
+        tuple[float, set[str], set[str], set[str], set[str], float]
+    ] = []
     for _, tags_str, flds in rows:
         cand_tags = set((tags_str or "").split())
         shared_tags = cur_tags & cand_tags
-        tag_score = sum(
-            _idf(stats.tag_counts.get(t, 0), stats.total) for t in shared_tags
+        tag_score = min(
+            1.0,
+            sum(
+                _bounded_idf(stats.tag_counts.get(t, 0), stats.total)
+                for t in shared_tags
+            ),
         )
 
         cand_imgs = set(_images_from_flds(flds or ""))
-        img_score = float(len(cur_imgs & cand_imgs))
-
-        cand_vec = _tfidf_vector(
-            tokens(_flds_text(flds), min_len=_TFIDF_TOKEN_MIN_LEN), stats
+        shared_imgs = cur_imgs & cand_imgs
+        img_score = (
+            len(shared_imgs) / max(1, len(cur_imgs))
+            if cur_imgs else 0.0
         )
+
+        cand_toks = tokens(_flds_text(flds), min_len=_TFIDF_TOKEN_MIN_LEN)
+        shared_toks = cur_toks & cand_toks
+        cand_vec = _tfidf_vector(cand_toks, stats)
         text_score = _cosine(cur_vec, cand_vec)
 
-        total = (weight_tag * tag_score
-                 + weight_image * img_score
-                 + weight_text * text_score)
+        total = (
+            weight_tag * tag_score
+            + weight_image * img_score
+            + weight_text * text_score
+        )
         if total <= 0:
             continue
-        for img in cand_imgs:
-            if img not in cur_imgs:
-                image_scores[img] += total
+        scored_notes.append(
+            (total, cand_imgs, shared_tags, shared_imgs, shared_toks, text_score)
+        )
 
-    return image_scores.most_common(limit)
+    scored_notes.sort(key=lambda row: row[0], reverse=True)
+    scored_notes = scored_notes[:cap]
+
+    image_scores: Counter[str] = Counter()
+    note_counts: Counter[str] = Counter()
+    reasons: dict[str, list[str]] = {}
+    for (
+        total,
+        cand_imgs,
+        shared_tags,
+        shared_imgs,
+        shared_toks,
+        text_score,
+    ) in scored_notes:
+        for img in cand_imgs:
+            if img in cur_imgs or img not in existing:
+                continue
+            image_ref_count = stats.image_counts.get(img, 0)
+            rarity = _bounded_idf(image_ref_count, stats.total)
+            # Common images still can be relevant, but they should not dominate
+            # solely by appearing on many notes.
+            rarity_factor = 0.1 + 0.9 * rarity * rarity
+            image_scores[img] += total * rarity_factor
+            note_counts[img] += 1
+
+            img_reasons = reasons.setdefault(img, [])
+            if shared_tags:
+                reason = (
+                    "Shared tags: "
+                    + _fmt_names(
+                        _top_terms_by_rarity(
+                            shared_tags, stats.tag_counts, limit=3
+                        )
+                    )
+                )
+                if reason not in img_reasons:
+                    img_reasons.append(reason)
+            if shared_imgs:
+                reason = "Appears near same image(s): " + _fmt_names(shared_imgs)
+                if reason not in img_reasons:
+                    img_reasons.append(reason)
+            if text_score >= 0.05 and shared_toks:
+                reason = (
+                    "Text overlap: "
+                    + _fmt_names(
+                        _top_terms_by_rarity(
+                            shared_toks, stats.token_counts, limit=4
+                        ),
+                        limit=4,
+                    )
+                )
+                if reason not in img_reasons:
+                    img_reasons.append(reason)
+            if rarity < 0.3 and image_ref_count > 1:
+                reason = f"Downranked because it is used on {image_ref_count} notes."
+                if reason not in img_reasons:
+                    img_reasons.append(reason)
+
+    out: list[RelatedImage] = []
+    for filename, score in image_scores.most_common(limit):
+        why = [f"Used on {note_counts[filename]} similar note(s)."]
+        why.extend(reasons.get(filename, [])[:5])
+        out.append(RelatedImage(filename, score, tuple(why)))
+    return out
+
+
+def related_images(
+    note,
+    candidates: Iterable[str],
+    *,
+    min_len: int = 3,
+    limit: int = 40,
+    cap: int = 300,
+    rare_tag_max_fraction: float = 0.2,
+    weight_filename: float = 1.0,
+    weight_tag: float = 1.0,
+    weight_image: float = 2.0,
+    weight_text: float = 1.0,
+) -> list[RelatedImage]:
+    """Rank images related to `note` using filename and similar-note signals."""
+    stats = _stats()
+    existing = set(candidates)
+    cur_imgs = set(images_in_note(note))
+
+    image_scores: Counter[str] = Counter()
+    reasons: dict[str, list[str]] = {}
+
+    for filename, (score, why) in _filename_suggestions(
+        note,
+        existing,
+        stats,
+        min_len=min_len,
+        weight_filename=weight_filename,
+    ).items():
+        if filename in cur_imgs:
+            continue
+        image_scores[filename] += score
+        reasons.setdefault(filename, []).extend(why)
+
+    for suggestion in _similar_image_suggestions(
+        note,
+        existing,
+        limit=max(limit * 3, limit),
+        cap=cap,
+        rare_tag_max_fraction=rare_tag_max_fraction,
+        weight_tag=weight_tag,
+        weight_image=weight_image,
+        weight_text=weight_text,
+    ):
+        if suggestion.filename in cur_imgs:
+            continue
+        image_scores[suggestion.filename] += suggestion.score
+        img_reasons = reasons.setdefault(suggestion.filename, [])
+        for reason in suggestion.reasons:
+            if reason not in img_reasons:
+                img_reasons.append(reason)
+
+    ranked = sorted(
+        image_scores.items(),
+        key=lambda item: (-item[1], item[0].lower()),
+    )
+    return [
+        RelatedImage(filename, score, tuple(reasons.get(filename, [])[:6]))
+        for filename, score in ranked[:limit]
+    ]
